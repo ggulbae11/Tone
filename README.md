@@ -31,6 +31,7 @@ uvicorn app.main:app --reload
 ```
 
 `.env`는 `backend/.env`에 두고 사용합니다. 예시는 `backend/.env.example`에 있습니다.
+`.env.example`을 복사해서 `.env`를 만들고  `LLM_API_KEY` 부분에 AI API를 적어 넣으면 됩니다. 
 
 ### 2. Frontend
 
