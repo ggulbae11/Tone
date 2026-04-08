@@ -46,8 +46,3 @@ npm run dev
 - Backend: `http://localhost:8000`
 - Swagger: `http://localhost:8000/docs`
 
-## 다음 단계에서 필요한 것
-
-- Python 3.11 실행 환경
-- Kiwi 연동 고도화
-- 운영용 PostgreSQL 또는 Docker 배포 환경
