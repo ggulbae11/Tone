@@ -82,6 +82,7 @@ function App() {
       const defaultLevel = AVAILABLE_LEVELS[0] ?? null;
       setSelectedLevel(defaultLevel);
       if (defaultLevel) {
+        setLoading("rewriting");
         const plan = await fetchRewritePlan(text, defaultLevel);
         setRewritePlan(plan);
       }
@@ -96,6 +97,7 @@ function App() {
     setLoading("rewriting");
     setError({});
     setSelectedLevel(level);
+    setSelectedSentence(null);
     setRewritePlan(null);
     try {
       const plan = await fetchRewritePlan(currentText, level);
@@ -115,15 +117,17 @@ function App() {
   const availableLevels = AVAILABLE_LEVELS;
   const selectedGuide = selectedLevel ? FORMALITY_GUIDE[selectedLevel] : null;
   const filteredSentences = result?.sentences ?? [];
+  const selectedRewrite = selectedSentence !== null ? rewriteMap.get(selectedSentence) : null;
+  const selectedSentenceData = selectedSentence !== null ? filteredSentences.find( (sentence) => sentence.index === selectedSentence ) : null;
+  const summaryText = rewritePlan && rewritePlan.rewrites.length > 0 ? `${rewritePlan.rewrites.length}개의 문장을 수정했습니다.` : null;
   
-
   return (
     <div className="app-shell">
       <aside className="sidebar">
         <div className="brand-block">
           <p className="brand-block__eyebrow">Business Korean QA</p>
           <h1>Tone Analyzer</h1>
-          <p className="brand-block__description">문서의 격식을 AI가 문맥까지 보고 분석하고, 선택한 기준에 맞지 않는 문장만 골라 수정안을 제안합니다.</p>
+          <p className="brand-block__description">문서의 격식을 AI가 문맥까지 보고 분석하여, 선택한 기준에 맞지 않는 문장을 골라 수정안을 제시합니다.</p>
         </div>
         <div className="stats-stack">
           <MetricCard title="전체 분석 수" value={`${stats?.total_analyses ?? 0}`} subtitle={`평균 점수 ${stats?.average_score ?? 0}`} accent="green" />
@@ -136,9 +140,12 @@ function App() {
         <section className="hero">
           <div>
             <p className="hero__kicker">Analyzer MVP</p>
-            <h2>AI가 문장을 분석하여, 원하는 격식으로 맞추는 수정안을 제안합니다.</h2>
+            <h2>AI가 문장을 분석하고, 선택한 격식에 맞는 수정안을 제안합니다.</h2>
           </div>
-          <button className="ghost-button" type="button" onClick={() => setText(SAMPLE_TEXT)}>샘플 문장 불러오기</button>
+          <div className="hero-actions">
+            <button className="ghost-button" type="button" onClick={() => setText(SAMPLE_TEXT)}>샘플 문장</button>
+            <button className="text-button" type="button" onClick={() => setText("")}>문장 지우기</button>
+          </div>
         </section>
 
         <section className="workspace-grid">
@@ -177,15 +184,24 @@ function App() {
                 ))}
               </div>
             </section>
-
+            
             <section className="panel">
               <div className="panel__header">
                 <h3>수정 제안</h3>
                 <span>
-                  {loading === "rewriting" ? `${selectedLevel} 기준으로 수정안 생성 중...` : "기준에 맞지 않는 문장은 빨간색으로 표시됩니다." }
+                  {loading === "rewriting" ? `${selectedLevel}을 기준으로 분석 중입니다...` : rewritePlan ? `${selectedLevel}을 기준으로 수정 완료` : "" }
                 </span>
               </div>
-              {rewritePlan ? <p className="rewrite-summary">{rewritePlan.summary}</p> : null}
+              {summaryText ? <p className="rewrite-summary">{summaryText}</p> : null}
+              {selectedRewrite && selectedSentenceData ? (
+                <div className="rewrite-detail-panel">
+                  <h4 className="rewrite-detail-title"> 수정 제안 상세 </h4>
+                  <div className="tooltip-section"> <span className="tooltip-label">수정 이유</span> <p>{selectedRewrite.reason}</p> </div>
+                  <div className="tooltip-section"> <span className="tooltip-label">원문</span> <p>{selectedSentenceData.text}</p> </div>
+                  <div className="tooltip-section tooltip-section--highlight"> <span className="tooltip-label">제안 문장</span> <p>{selectedRewrite.suggested_sentence}</p> </div>
+                  <div className="tooltip-footer"> {getRewriteSourceLabel(selectedRewrite.source)} </div>
+                </div>
+              ) : null}
               <div className="sentence-review-list">
                 {loading === "rewriting" ? (
                   <div className="analysis-loading">
@@ -196,23 +212,23 @@ function App() {
                       <div className="sentence-skeleton" />
                     </div>
                   </div>
-                ) : filteredSentences.length === 0 ? (
-                  <p className="empty-state"> 수정이 필요한 문장이 없습니다. </p>
+                ) : rewriteMap.size === 0 ? (
+                  <p className="empty-state"> 선택한 격식 기준에서 수정이 필요한 문장이 없습니다. </p>
                 ) : ( 
                   filteredSentences.map((sentence) => {
-                    const rewrite = rewriteMap.get(sentence.index);
                     const mismatched = selectedLevel !== null && sentence.formality !== selectedLevel;
+                    const hasRewrite = rewriteMap.has(sentence.index);
                     return (
-                      <div className={`sentence-review-item ${mismatched ? "is-mismatched" : ""} ${selectedSentence === sentence.index ? "is-selected" : ""}`} key={sentence.index} onClick={() => setSelectedSentence(sentence.index)}>
+                      <div className={`sentence-review-item ${mismatched ? "is-mismatched" : ""} ${selectedSentence === sentence.index ? "is-selected" : ""} ${hasRewrite ? "has-rewrite" : ""}`} key={sentence.index} onClick={() => { if (!hasRewrite) return; setSelectedSentence((prev) => prev === sentence.index ? null : sentence.index ); }}>
                         <span className="sentence-review-index">{sentence.index + 1}</span>
                         <span className="sentence-review-text">{sentence.text}</span>
                         <span className="sentence-review-badge">{sentence.formality}</span>
-                        {rewrite ? <div className="sentence-tooltip"><strong>수정 이유</strong><p>{rewrite.reason}</p><strong>제안 문장</strong><p>{rewrite.suggested_sentence}</p><strong>생성 방식</strong><p>{getRewriteSourceLabel(rewrite.source)}</p></div> : null}
                       </div>
                     );
                   })
                 )}
               </div>
+              
             </section>
           </section>
         </section>
