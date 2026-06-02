@@ -14,6 +14,7 @@ class MorphologyAnalyzer:
     known_endings = [
         "습니다",
         "습니까",
+        "합니다",
         "입니다",
         "드립니다",
         "바랍니다",
@@ -28,6 +29,9 @@ class MorphologyAnalyzer:
         "요",
         "냐",
         "야",
+        "줘",
+        "할게",
+        "을게",
         "어",
         "지",
         "다",

@@ -1,64 +1,53 @@
-export type Severity = "high" | "medium" | "low";
-export type FormalityLevel = "격식 존댓말" | "중립 존댓말" | "비격식 반말" | "mixed";
-export type TargetRewriteLevel = "격식 존댓말" | "중립 존댓말" | "비격식 반말";
-export type RewriteSource = "ai" | "rule-based";
-
-export interface DistributionItem {
+export interface ContextFactor {
+  key: string;
   label: string;
-  count: number;
+  group: string;
+  value: string;
+  description: string;
 }
 
-export interface SentenceAnalysis {
+export interface ImplicitStyle {
+  value: string;
+  reason: string;
+}
+
+export interface ContextAnalysis {
+  factors: ContextFactor[];
+  overall_summary: string;
+  implicit_style: ImplicitStyle | null;
+}
+
+export interface SentenceResult {
   index: number;
   text: string;
-  ending: string;
-  formality: FormalityLevel;
+  // 1차: 개별 요소 대조
+  is_consistent: boolean;
+  violated_factors: string[];
+  inconsistency_reason: string | null;
+  suggested_rewrite: string | null;
+  // 2차: 전체 흐름 대조
+  has_flow_issue: boolean;
+  flow_issue_reason: string | null;
+  flow_suggested_rewrite: string | null;
+  // 3차: 암묵적 문체 이탈
+  has_implicit_style_issue: boolean;
+  implicit_style_reason: string | null;
+  implicit_style_rewrite: string | null;
 }
 
-export interface AnalysisIssue {
-  type: string;
-  severity: Severity;
-  message: string;
-  sentence_indexes: number[];
-  highlight_texts: string[];
-}
-
-export interface HighlightSpan {
-  text: string;
-  type: string;
-  severity: Severity;
-}
-
-export interface RewriteSuggestion {
-  sentence_index: number;
-  original_sentence: string;
-  current_formality: string;
-  target_formality: string;
-  reason: string;
-  suggested_sentence: string;
-  source: RewriteSource;
-}
-
-export interface RewritePlanResponse {
-  target_level: TargetRewriteLevel;
-  dominant_formality: FormalityLevel;
-  available_levels: string[];
-  summary: string;
-  rewrites: RewriteSuggestion[];
+export interface ContextOnlyResponse {
+  context: ContextAnalysis;
 }
 
 export interface FullAnalysisResponse {
+  context: ContextAnalysis;
+  sentences: SentenceResult[];
   overall_score: number;
-  formality_level: FormalityLevel;
-  formality_score: number;
-  consistency_score: number;
-  tone_label: string;
-  tone_confidence: number;
-  sentence_count: number;
-  endings_distribution: DistributionItem[];
-  sentences: SentenceAnalysis[];
-  issues: AnalysisIssue[];
-  highlights: HighlightSpan[];
+  consistent_count: number;
+  inconsistent_count: number;
+  flow_issue_count: number;
+  implicit_style_issue_count: number;
+  flow_summary: string;
   summary: string;
 }
 
@@ -69,6 +58,7 @@ export interface HistoryItem {
   formality_level: string;
   tone_label: string;
   issue_count: number;
+  result_payload: FullAnalysisResponse;
   created_at: string;
 }
 

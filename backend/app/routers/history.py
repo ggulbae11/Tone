@@ -16,6 +16,13 @@ def get_history(db: Session = Depends(get_db)) -> list[AnalysisHistory]:
     return db.query(AnalysisHistory).order_by(desc(AnalysisHistory.created_at)).limit(20).all()
 
 
+@router.delete("/history", status_code=200)
+def clear_history(db: Session = Depends(get_db)) -> dict:
+    db.query(AnalysisHistory).delete()
+    db.commit()
+    return {"deleted": True}
+
+
 @router.get("/stats", response_model=StatsResponse)
 def get_stats(db: Session = Depends(get_db)) -> StatsResponse:
     rows = db.query(AnalysisHistory).all()

@@ -3,59 +3,92 @@ from __future__ import annotations
 import concurrent.futures
 import hashlib
 import json
-from collections import Counter
 from typing import Any
 
 from app.config import settings
-from app.schemas.analysis import DistributionItem, SentenceAnalysis
 from app.services.formality_analyzer import FormalityAnalyzer
 from app.services.morphology_service import SentenceToken
 
 try:
-    from google import genai
-    from google.genai import types
+    from openai import OpenAI
 except ImportError:  # pragma: no cover
-    genai = None  # type: ignore[assignment]
-    types = None  # type: ignore[assignment]
+    OpenAI = None  # type: ignore[assignment,misc]
 
 
-SYSTEM_PROMPT = (
-    "당신은 한국어 비즈니스 문서의 격식을 문장 뉘앙스와 문맥까지 고려해 분류하고, "
-    "선택한 격식 기준에 맞춰 수정안을 제안하는 편집 전문가다."
+SYSTEM_PROMPT_CONTEXT = (
+    "당신은 한국어 텍스트를 분석하는 언어 전문가입니다. "
+    "주어진 글의 전체적인 맥락(상황, 관계, 목적 등)을 파악하여 구조화된 JSON으로 반환합니다. "
+    "반드시 유효한 JSON만 출력하세요."
 )
 
-ANALYSIS_RULES = [
-    "문장 끝 표현만 보지 말고 관계, 상황, 압박감, 친밀도, 전체 뉘앙스를 함께 판단한다.",
-    "격식 단계는 격식 존댓말, 중립 존댓말, 비격식 반말 중 하나로 분류한다.",
-    "수정안은 선택한 격식 기준에 맞지 않는 문장에 대해서만 작성한다.",
-    "판단이 애매하면 가장 가까운 단계 하나를 고르고 reason에 근거를 적는다.",
-]
+SYSTEM_PROMPT_SENTENCES = (
+    "당신은 한국어 텍스트를 분석하는 언어 전문가입니다. "
+    "확정된 맥락을 기준으로 각 문장이 맥락의 모든 요소와 하나하나 일치하는지 판단하고, "
+    "맞지 않는 문장에 수정안을 제안합니다. "
+    "수정안의 목표는 이 글의 목소리·결·리듬을 살리면서 "
+    "맥락·톤이 일관된 자연스러운 완성된 글을 만드는 것입니다. "
+    "일반적으로 더 나은 문장이 아니라, 이 텍스트 안에서 자연스러운 문장이 기준입니다. "
+    "반드시 유효한 JSON만 출력하세요."
+)
 
-FORMALITY_RULE_STEPS = [
-    {
-        "level": "격식 존댓말",
-        "description": "회사, 발표, 면접, 공적인 대화에서 사용하는 딱딱한 존댓말",
-        "signals": ["습니다", "습니까", "입니다", "드립니다", "바랍니다"],
-    },
-    {
-        "level": "중립 존댓말",
-        "description": "일상 대화, 서비스업 등에서 사용하는 부드러운 존댓말",
-        "signals": ["요"],
-    },
-    {
-        "level": "비격식 반말",
-        "description": "친근하지만 기본적인 예의를 유지하는 반말",
-        "signals": ["냐", "야", "어", "지", "다"],
-    },
-]
+SYSTEM_PROMPT_FLOW = (
+    "당신은 한국어 텍스트의 전체적인 흐름과 응집성을 검토하는 편집 전문가입니다. "
+    "개별 문장이 맥락 요소와 일치하더라도 문장 간 연결과 전체 흐름에 문제가 있는지 판단합니다. "
+    "수정안의 목표는 이 글의 목소리·결·리듬을 살리면서 "
+    "흐름이 자연스럽게 이어지는 완성된 글을 만드는 것입니다. "
+    "일반적으로 더 나은 문장이 아니라, 이 텍스트 안에서 자연스러운 문장이 기준입니다. "
+    "반드시 유효한 JSON만 출력하세요."
+)
 
-REWRITE_RULES = [
-    "원문을 그대로 반복하지 말고 실제로 달라진 문장을 제안한다.",
-    "수정 이유는 짧고 구체적으로 쓴다.",
-    "문맥을 유지하면서 최소 수정으로 목표 격식에 맞춘다.",
-]
+# 암묵적 문체 특성 추출 기준 (프롬프트 삽입용)
+_IMPLICIT_STYLE_CRITERIA = """
+[암묵적 문체 특성 추출 기준]
+다음 조건을 반드시 따르세요.
 
-FORMALITY_REWRITE_RULE = "선택한 격식 단계에 맞게 종결어미와 요청 표현을 조정한다."
+━━━ 핵심 원칙 ━━━
+분석 요소 값은 글의 '방향'(절제됨, 격식 높음 등)을 설명할 뿐,
+'어떤 구체적 표현으로 구현되는지'는 설명하지 못한다.
+emotional_tone=절제됨이라고 해도, 그 절제가 특정 어구 패턴으로 반복 구현되고 있다면 추출한다.
+
+━━━ 즉시 null (단, P2·P3 해당 시 null 처리하지 않음) ━━━
+- 완성된 문장이 3개 미만
+- 공문서 / 법적 문서 / 학술 논문 / 행정 양식
+- 전체 격식·분위기가 요소 값으로 설명되고, P2·P3도 해당하지 않는 경우
+- 애매한 경우 → null
+
+━━━ 추출 조건 ━━━
+P1. 실제 언어 패턴이 요소 값만으로 예측되지 않을 때
+
+P2. 비슷한 역할을 하는 표현·구조가 2곳 이상 반복될 때
+    (정확히 같은 표현이 아니어도, 동일한 기능을 하면 해당)
+    판단 질문: "이 요소 값들을 아는 사람이 글을 새로 쓴다면,
+    이런 구체적 표현 패턴을 자연스럽게 선택할까?" → 아니라면 추출
+
+P3. 특정 커뮤니티·세대·직군 특유 어휘가 2곳 이상 반복될 때
+
+━━━ 판단 예시 ━━━
+[추출 O] "점심은 먹었어? / 생각났어, 바쁘면 괜찮고. / 주말에 뭐 해? 그냥 궁금해서."
+→ emotional_tone=절제됨으로 태그되더라도,
+  관심 표현 직후 감정을 차단하는 어구가 반복되는 것은 P2 해당.
+  올바른 value 예시: "관심이나 감정을 내비친 직후 즉시 거리두기로 마무리하는 패턴, 감정 직접 언급 없음"
+  잘못된 value 예시: "'바쁘면 괜찮고', '그냥 궁금해서' 표현 사용" ← 글의 내용을 그대로 옮긴 것
+
+[추출 O] "야 오늘 ㄹㅇ 힘들었음. 팀장이 또 뒤집었고 멘탈 탈탈. 칼퇴 물 건너갔음."
+→ 직장인 커뮤니티 특유 어휘 반복 → P3 해당.
+  올바른 value 예시: "직장인 온라인 커뮤니티 특유의 줄임말·과장 표현 일관 사용"
+  잘못된 value 예시: "'ㄹㅇ', '멘탈 탈탈', '칼퇴' 표현 사용" ← 글의 내용을 그대로 옮긴 것
+
+[추출 X] "보고서 완료했습니다. 확인 부탁드립니다. 추가 수정 시 말씀해주세요."
+→ 표준 업무 존댓말. formality=높음, power_distance=큰 으로 충분히 예측 가능 → null.
+
+━━━ 추출 시 작성 ━━━
+- value: 관찰한 증거를 바탕으로 도출한 '패턴·규칙'을 서술한다.
+  글에서 찾은 특정 표현을 그대로 나열하지 말 것.
+  "어떤 표현을 썼는가"가 아니라 "어떤 방식으로 쓰는가"를 설명할 것.
+  (좋은 예: "감정 표현 후 즉시 거리두기로 마무리하는 패턴")
+  (나쁜 예: "'그냥', '바쁘면 괜찮고' 등 표현 반복")
+- reason: 이 패턴이 요소 값만으로 재현되지 않는 이유 한 줄로
+""".strip()
 
 
 class LLMService:
@@ -63,363 +96,415 @@ class LLMService:
         self._client = None
         self._cache: dict[str, Any] = {}
         self._fallback_formality = FormalityAnalyzer()
-        if settings.llm_provider == "gemini" and settings.llm_api_key and genai is not None:
-            self._client = genai.Client(api_key=settings.llm_api_key)
+        if settings.llm_provider == "openai" and settings.llm_api_key and OpenAI is not None:
+            self._client = OpenAI(api_key=settings.llm_api_key)
 
-    def classify_formality(self, sentences: list[SentenceToken]) -> dict[str, Any]:
-        cache_key = self._make_classification_cache_key(sentences)
+    # ── 1단계: 맥락 추출 ──────────────────────────────────────────────────────
+
+    def extract_context(self, text: str, factors: list[dict[str, str]]) -> dict[str, Any]:
+        cache_key = "ctx:" + self._hash(text, [f["key"] for f in factors])
+        if cache_key in self._cache:
+            return self._cache[cache_key]
+
+        if self._client is None:
+            result = self._rule_based_context(factors)
+            self._cache[cache_key] = result
+            return result
+
+        prompt = self._build_extract_context_prompt(text, factors)
+        last_err = "UnknownError"
+        for model in self._candidate_models():
+            try:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    raw = ex.submit(self._call, SYSTEM_PROMPT_CONTEXT, model, prompt).result(
+                        timeout=settings.llm_timeout_seconds
+                    )
+                result = self._parse_context(raw, factors)
+                if result["context"]:
+                    self._cache[cache_key] = result
+                    return result
+            except concurrent.futures.TimeoutError:
+                last_err = "TimeoutError"
+            except Exception as exc:  # pragma: no cover
+                last_err = exc.__class__.__name__
+
+        result = self._rule_based_context(factors)
+        result["source"] = f"rule-based-fallback:{last_err}"
+        self._cache[cache_key] = result
+        return result
+
+    def _build_extract_context_prompt(self, text: str, factors: list[dict[str, str]]) -> str:
+        factor_lines = "\n".join(f"- {f['label']} ({f['key']}): {f['description']}" for f in factors)
+        context_schema = ", ".join('"' + f["key"] + '": "..."' for f in factors)
+        return (
+            f"[분석 요소]\n{factor_lines}\n\n"
+            f"[전체 원문]\n{text}\n\n"
+            "[지시]\n"
+            "1. 전체 원문을 읽고 각 분석 요소의 값을 구체적으로 파악하세요.\n"
+            "2. 글 전체의 맥락을 overall_summary에 한 문장으로 요약하세요.\n"
+            f"3. 암묵적 문체 특성(implicit_style)을 아래 기준에 따라 추출하세요.\n\n"
+            f"{_IMPLICIT_STYLE_CRITERIA}\n\n"
+            "4. JSON만 출력하세요.\n\n"
+            "[출력 형식]\n"
+            "{\n"
+            f'  "context": {{ {context_schema} }},\n'
+            '  "overall_summary": "...",\n'
+            '  "implicit_style": { "value": "...", "reason": "..." }\n'
+            '  // 추출 불필요 시: "implicit_style": null\n'
+            "}"
+        )
+
+    def _parse_context(self, raw: str, factors: list[dict[str, str]]) -> dict[str, Any]:
+        payload = json.loads(raw)
+        context_data = payload.get("context", {}) if isinstance(payload, dict) else {}
+        overall_summary = str(payload.get("overall_summary", "")).strip()
+
+        implicit_style = None
+        raw_is = payload.get("implicit_style")
+        if isinstance(raw_is, dict):
+            value = str(raw_is.get("value", "")).strip()
+            reason = str(raw_is.get("reason", "")).strip()
+            if value:
+                implicit_style = {"value": value, "reason": reason}
+
+        return {
+            "context": context_data,
+            "overall_summary": overall_summary,
+            "implicit_style": implicit_style,
+            "source": "ai",
+        }
+
+    def _rule_based_context(self, factors: list[dict[str, str]]) -> dict[str, Any]:
+        return {
+            "context": {f["key"]: "분석 불가 (API 키 설정 필요)" for f in factors},
+            "overall_summary": "AI 연결이 필요합니다.",
+            "implicit_style": None,
+            "source": "rule-based",
+        }
+
+    # ── 2단계: 확정된 맥락으로 문장 분석 ─────────────────────────────────────
+
+    def check_sentences_against_context(
+        self,
+        text: str,
+        sentences: list[SentenceToken],
+        context: dict[str, str],
+        factors: list[dict[str, str]],
+        implicit_style_value: str = "",
+    ) -> dict[str, Any]:
+        cache_key = "sent:" + self._hash(text, context, implicit_style_value)
         if cache_key in self._cache:
             return self._cache[cache_key]
 
         if not sentences or self._client is None:
-            fallback = self._build_rule_based_classification(sentences)
-            self._cache[cache_key] = fallback
-            return fallback
+            result = self._rule_based_sentences(sentences, factors)
+            self._cache[cache_key] = result
+            return result
 
-        prompt = self._build_classification_prompt(sentences)
-        last_error_name = "UnknownError"
-
+        prompt = self._build_sentences_prompt(text, sentences, context, factors, implicit_style_value)
+        last_err = "UnknownError"
         for model in self._candidate_models():
             try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._generate_classification_json, model, prompt)
-                    raw = future.result(timeout=settings.llm_timeout_seconds)
-                classified = self._parse_classification_json(raw, sentences)
-                if classified["sentence_labels"]:
-                    self._cache[cache_key] = classified
-                    return classified
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    raw = ex.submit(self._call, SYSTEM_PROMPT_SENTENCES, model, prompt).result(
+                        timeout=settings.llm_timeout_seconds
+                    )
+                result = self._parse_sentences(raw, sentences, factors)
+                if result["sentences"]:
+                    self._cache[cache_key] = result
+                    return result
             except concurrent.futures.TimeoutError:
-                last_error_name = "TimeoutError"
-                continue
+                last_err = "TimeoutError"
             except Exception as exc:  # pragma: no cover
-                last_error_name = exc.__class__.__name__
-                continue
+                last_err = exc.__class__.__name__
 
-        fallback = self._build_rule_based_classification(sentences)
-        fallback["source"] = f"rule-based-fallback:{last_error_name}"
-        self._cache[cache_key] = fallback
-        return fallback
+        result = self._rule_based_sentences(sentences, factors)
+        result["source"] = f"rule-based-fallback:{last_err}"
+        self._cache[cache_key] = result
+        return result
 
-    def suggest_rewrites(
+    def _build_sentences_prompt(
         self,
-        original_text: str,
-        target_level: str,
-        sentences: list[SentenceAnalysis],
-    ) -> list[dict[str, Any]]:
-        cache_key = self._make_rewrite_cache_key(original_text, target_level, sentences)
+        text: str,
+        sentences: list[SentenceToken],
+        context: dict[str, str],
+        factors: list[dict[str, str]],
+        implicit_style_value: str = "",
+    ) -> str:
+        context_lines = "\n".join(
+            f"- {f['label']} ({f['key']}): {context.get(f['key'], '미정')}" for f in factors
+        )
+        factor_keys = ", ".join(f'"{f["key"]}"' for f in factors)
+        sentence_lines = "\n".join(f'- index={s.index}, text="{s.text}"' for s in sentences)
+
+        implicit_section = ""
+        if implicit_style_value.strip():
+            implicit_section = (
+                "\n[암묵적 문체 특성 — 명시적 요소 외 이 글의 고유한 문체 패턴]\n"
+                f"{implicit_style_value}\n"
+            )
+
+        implicit_instruction = ""
+        implicit_output_fields = (
+            '      "has_implicit_style_issue": false,\n'
+            '      "implicit_style_reason": "",\n'
+            '      "implicit_style_rewrite": ""\n'
+        )
+        if implicit_style_value.strip():
+            implicit_instruction = (
+                "6. 위 암묵적 문체 특성도 각 문장이 지키고 있는지 확인하세요.\n"
+                "   - 위반 시 has_implicit_style_issue=true, implicit_style_reason에 이유를 작성하세요.\n"
+                "   - implicit_style_rewrite 원칙: 문체와 맞지 않는 표현만 최소한으로 수정하고,\n"
+                "     글의 말투·리듬·구체적 디테일은 그대로 보존하세요.\n"
+                "     이 글 특유의 결(거칠거나 투박한 표현 포함)을 살린 채 일관성만 맞추세요.\n"
+                "     해당 문장 하나의 내용만 포함하고 앞뒤 문장과 합치지 마세요.\n"
+                "   - 명시적 요소 위반(is_consistent=false)인 문장은 has_implicit_style_issue 판단을 생략하고 false로 두세요.\n"
+            )
+
+        return (
+            "[확정된 맥락 — 사용자가 검토·수정 완료한 값입니다. 이 값을 기준으로 분석하세요]\n"
+            f"{context_lines}\n"
+            f"{implicit_section}\n"
+            f"[전체 원문]\n{text}\n\n"
+            f"[문장 목록]\n{sentence_lines}\n\n"
+            "[지시]\n"
+            f"1. 각 문장을 위 맥락의 요소 하나하나({factor_keys})와 개별적으로 대조하세요.\n"
+            "2. 단 하나의 요소라도 확정된 값과 맞지 않으면 is_consistent=false로 판단하세요.\n"
+            "3. violated_factors에 맞지 않은 요소의 key를 배열로 나열하세요 (일치하면 []).\n"
+            "4. inconsistency_reason에 어떤 요소가 왜 맞지 않는지 구체적으로 설명하세요.\n"
+            "5. suggested_rewrite 작성 원칙 — 반드시 따르세요:\n"
+            "   [무엇을 고치는가]\n"
+            "   - 맥락과 맞지 않는 표현만 최소한으로 수정하세요.\n"
+            "   - 문제없는 부분은 원문 표현을 그대로 유지하세요.\n"
+            "   [무엇을 보존하는가]\n"
+            "   - 글의 말투·리듬·어조를 그대로 살리세요.\n"
+            "   - 장소·인물·상황 등 구체적 디테일을 삭제하거나 일반화하지 마세요.\n"
+            "   - 거칠거나 투박한 표현이 이 글의 특성이라면, 수정 후에도 그 결을 유지하세요.\n"
+            "   [목표]\n"
+            "   - 이 글의 목소리와 결을 살리면서, 맥락·톤이 일관된 자연스러운 완성된 글을 만드세요.\n"
+            "   - 일반적으로 '더 나은 문장'이 아니라, '이 텍스트 안에서 자연스러운 문장'이 기준입니다.\n"
+            "   - 예) 반말 카톡에서 한 문장만 존댓말이면 → 그 문장만 반말로 바꾸고 나머지는 그대로\n"
+            "   [형식]\n"
+            "   - 해당 문장 하나의 내용만 포함하세요. 앞뒤 문장과 합치지 마세요.\n"
+            f"{implicit_instruction}"
+            "일치하는 문장은 violated_factors=[], inconsistency_reason=\"\", suggested_rewrite=\"\"로 두세요.\n\n"
+            "[출력 형식 — 반드시 이 JSON 구조만 출력]\n"
+            "{\n"
+            '  "sentences": [\n'
+            "    {\n"
+            '      "sentence_index": 0,\n'
+            '      "is_consistent": true,\n'
+            '      "violated_factors": [],\n'
+            '      "inconsistency_reason": "",\n'
+            '      "suggested_rewrite": "",\n'
+            f"{implicit_output_fields}"
+            "    }\n"
+            "  ]\n"
+            "}"
+        )
+
+    def _parse_sentences(
+        self,
+        raw: str,
+        sentences: list[SentenceToken],
+        factors: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        payload = json.loads(raw)
+        valid_keys = {f["key"] for f in factors}
+        by_index: dict[int, dict[str, Any]] = {}
+        for item in payload.get("sentences", []):
+            if not isinstance(item, dict):
+                continue
+            idx = int(item.get("sentence_index", -1))
+            if idx < 0:
+                continue
+            is_consistent = bool(item.get("is_consistent", True))
+            raw_violated = item.get("violated_factors", [])
+            violated = [k for k in raw_violated if isinstance(k, str) and k in valid_keys] if not is_consistent else []
+            reason = str(item.get("inconsistency_reason", "")).strip() or None
+            rewrite = str(item.get("suggested_rewrite", "")).strip() or None
+
+            has_implicit = bool(item.get("has_implicit_style_issue", False)) and is_consistent
+            implicit_reason = str(item.get("implicit_style_reason", "")).strip() or None
+            implicit_rewrite = str(item.get("implicit_style_rewrite", "")).strip() or None
+
+            by_index[idx] = {
+                "is_consistent": is_consistent,
+                "violated_factors": violated,
+                "inconsistency_reason": reason if not is_consistent else None,
+                "suggested_rewrite": rewrite if not is_consistent else None,
+                "has_implicit_style_issue": has_implicit,
+                "implicit_style_reason": implicit_reason if has_implicit else None,
+                "implicit_style_rewrite": implicit_rewrite if has_implicit else None,
+            }
+
+        results = []
+        for s in sentences:
+            matched = by_index.get(s.index, {
+                "is_consistent": True,
+                "violated_factors": [],
+                "inconsistency_reason": None,
+                "suggested_rewrite": None,
+                "has_implicit_style_issue": False,
+                "implicit_style_reason": None,
+                "implicit_style_rewrite": None,
+            })
+            results.append({"sentence_index": s.index, **matched})
+        return {"sentences": results, "source": "ai"}
+
+    def _rule_based_sentences(self, sentences: list[SentenceToken], factors: list[dict[str, str]]) -> dict[str, Any]:
+        from collections import Counter
+        labels = [self._fallback_formality.detect_formality(s.ending) for s in sentences]
+        counter: Counter[str] = Counter(labels)
+        dominant = counter.most_common(1)[0][0] if counter else "중립 존댓말"
+        results = []
+        for s, label in zip(sentences, labels):
+            ok = label == dominant
+            results.append({
+                "sentence_index": s.index,
+                "is_consistent": ok,
+                "violated_factors": [] if ok else ["formality_expected"],
+                "inconsistency_reason": None if ok else f"주된 격식({dominant})과 다른 표현입니다.",
+                "suggested_rewrite": None,
+                "has_implicit_style_issue": False,
+                "implicit_style_reason": None,
+                "implicit_style_rewrite": None,
+            })
+        return {"sentences": results, "source": "rule-based"}
+
+    # ── 2차: 전체 흐름 검토 ───────────────────────────────────────────────────
+
+    def check_document_flow(
+        self,
+        text: str,
+        context: dict[str, str],
+        pass1_sentences: list[dict[str, Any]],
+        factors: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        cache_key = "flow:" + self._hash(text, [s["sentence_index"] for s in pass1_sentences])
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        if not sentences:
-            return []
+        if not pass1_sentences or self._client is None:
+            return self._rule_based_flow(pass1_sentences)
 
-        if self._client is None:
-            fallback = self._build_rule_based_rewrites(target_level, sentences)
-            self._cache[cache_key] = fallback
-            return fallback
-
-        prompt = self._build_rewrite_prompt(target_level, sentences)
-        last_error_name = "UnknownError"
-
+        prompt = self._build_flow_prompt(text, context, pass1_sentences, factors)
+        last_err = "UnknownError"
         for model in self._candidate_models():
             try:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(self._generate_rewrite_json, model, prompt)
-                    raw = future.result(timeout=settings.llm_timeout_seconds)
-                rewrites = self._parse_rewrite_json(raw, target_level)
-                if rewrites:
-                    self._cache[cache_key] = rewrites
-                    return rewrites
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+                    raw = ex.submit(self._call, SYSTEM_PROMPT_FLOW, model, prompt).result(
+                        timeout=settings.llm_timeout_seconds
+                    )
+                result = self._parse_flow(raw, pass1_sentences)
+                if result["sentences"]:
+                    self._cache[cache_key] = result
+                    return result
             except concurrent.futures.TimeoutError:
-                last_error_name = "TimeoutError"
-                continue
+                last_err = "TimeoutError"
             except Exception as exc:  # pragma: no cover
-                last_error_name = exc.__class__.__name__
-                continue
+                last_err = exc.__class__.__name__
 
-        fallback = self._build_rule_based_rewrites(target_level, sentences)
-        if fallback:
-            fallback[0]["reason"] = f"AI 응답을 받지 못해 규칙 기반 제안으로 대체했습니다: {last_error_name}. {fallback[0]['reason']}"
-        self._cache[cache_key] = fallback
-        return fallback
+        result = self._rule_based_flow(pass1_sentences)
+        result["source"] = f"rule-based-fallback:{last_err}"
+        self._cache[cache_key] = result
+        return result
 
-    def _build_rule_guide(self) -> str:
-        lines = [f"[System Prompt]\n{SYSTEM_PROMPT}", "[Analysis Rules]"]
-        lines.extend(f"- {rule}" for rule in ANALYSIS_RULES)
-        lines.append("[Formality Levels]")
-        for item in FORMALITY_RULE_STEPS:
-            lines.append(f"- {item['level']}: {item['description']} / hints={', '.join(item['signals'])}")
-        lines.append("[Rewrite Rules]")
-        lines.extend(f"- {rule}" for rule in REWRITE_RULES)
-        return "\n".join(lines)
-
-    def _generate_classification_json(self, model: str, prompt: str) -> str:
-        if self._client is None:
-            return ""
-        config: dict[str, Any] = {
-            "temperature": 0.1,
-            "max_output_tokens": 900,
-            "response_mime_type": "application/json",
-            "response_json_schema": {
-                "type": "object",
-                "properties": {
-                    "sentences": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "sentence_index": {"type": "integer"},
-                                "label": {"type": "string"},
-                                "confidence": {"type": "number"},
-                                "reason": {"type": "string"}
-                            },
-                            "required": ["sentence_index", "label", "confidence", "reason"]
-                        }
-                    }
-                },
-                "required": ["sentences"]
-            }
-        }
-        if types is not None:
-            config["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        response = self._client.models.generate_content(model=model, contents=prompt, config=config)
-        text = getattr(response, "text", None)
-        return text if isinstance(text, str) else str(text or "")
-
-    def _generate_rewrite_json(self, model: str, prompt: str) -> str:
-        if self._client is None:
-            return ""
-        config: dict[str, Any] = {
-            "temperature": 0.2,
-            "max_output_tokens": 700,
-            "response_mime_type": "application/json",
-            "response_json_schema": {
-                "type": "object",
-                "properties": {
-                    "rewrites": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "sentence_index": {"type": "integer"},
-                                "original_sentence": {"type": "string"},
-                                "current_formality": {"type": "string"},
-                                "target_formality": {"type": "string"},
-                                "reason": {"type": "string"},
-                                "suggested_sentence": {"type": "string"},
-                                "source": {"type": "string"}
-                            },
-                            "required": ["sentence_index", "original_sentence", "current_formality", "target_formality", "reason", "suggested_sentence", "source"]
-                        }
-                    }
-                },
-                "required": ["rewrites"]
-            }
-        }
-        if types is not None:
-            config["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
-        response = self._client.models.generate_content(model=model, contents=prompt, config=config)
-        text = getattr(response, "text", None)
-        return text if isinstance(text, str) else str(text or "")
-
-    def _build_classification_prompt(self, sentences: list[SentenceToken]) -> str:
-        sentence_lines = "\n".join(f"- index={sentence.index}, text={sentence.text}" for sentence in sentences)
+    def _build_flow_prompt(self, text, context, pass1_sentences, factors) -> str:
+        context_lines = "\n".join(f"- {f['label']}: {context.get(f['key'], '파악 불가')}" for f in factors)
+        sentence_lines = "\n".join(
+            "- index={idx}, text=\"{text}\", 1차결과={result}".format(
+                idx=s["sentence_index"], text=s.get("text", ""),
+                result="불일치" if not s["is_consistent"] else "일치",
+            )
+            for s in pass1_sentences
+        )
         return (
-            f"{self._build_rule_guide()}\n\n"
-            "[Current Task]\n아래 문장 각각을 문장 끝 표현만이 아니라 어휘, 압박감, 친밀도, 공적/사적 상황의 뉘앙스를 함께 고려해 분류하세요.\n"
-            "반드시 JSON만 출력하세요.\n\n"
-            f"대상 문장 목록:\n{sentence_lines}"
+            f"[파악된 맥락]\n{context_lines}\n\n"
+            f"[전체 원문]\n{text}\n\n"
+            f"[문장별 1차 분석 결과]\n{sentence_lines}\n\n"
+            "[지시]\n"
+            "1차 분석에서 각 문장이 개별 맥락 요소와 일치하는지 확인했습니다.\n"
+            "이제 글 전체의 흐름과 응집성 관점에서 2차 검토를 하세요.\n\n"
+            "다음 기준으로 흐름 문제를 판단하세요:\n"
+            "- 문장 간 전환이 갑작스럽거나 어색한 경우\n"
+            "- 개별 요소는 맞지만 전체 메시지의 일관성을 해치는 경우\n"
+            "- 주제나 논리 흐름에서 뜬금없이 벗어나는 경우\n"
+            "- 전체 글의 목적과 어울리지 않는 어조나 내용인 경우\n\n"
+            "- has_flow_issue=true인 문장만 flow_issue_reason과 flow_suggested_rewrite를 작성하세요.\n"
+            "- flow_suggested_rewrite 작성 원칙:\n"
+            "  · 흐름 문제를 일으키는 표현만 최소한으로 수정하세요.\n"
+            "  · 문제없는 부분은 원문 표현을 그대로 유지하세요.\n"
+            "  · 글의 말투·리듬·구체적 디테일(장소·인물·상황)을 삭제하거나 일반화하지 마세요.\n"
+            "  · 이 글 특유의 결(거칠거나 투박한 표현 포함)을 살린 채 흐름만 자연스럽게 만드세요.\n"
+            "  · 전환이 어색하더라도 다음 문장 내용을 가져오지 마세요.\n"
+            "    현재 문장 표현·어조를 수정해서 흐름을 부드럽게 하세요.\n"
+            "  · 해당 문장 하나의 내용만 포함하고, 앞뒤 문장과 합치지 마세요.\n"
+            "- flow_summary에 글 전체 흐름 종합 평가를 한 문장으로 작성하세요.\n"
+            "[출력 형식]\n"
+            "{\n"
+            '  "flow_summary": "...",\n'
+            '  "sentences": [\n'
+            '    { "sentence_index": 0, "has_flow_issue": false, "flow_issue_reason": "", "flow_suggested_rewrite": "" }\n'
+            "  ]\n"
+            "}"
         )
 
-    def _build_rewrite_prompt(self, target_level: str, sentences: list[SentenceAnalysis]) -> str:
-        sentence_lines = "\n".join(f"- index={sentence.index}, formality={sentence.formality}, text={sentence.text}" for sentence in sentences)
-        return (
-            f"{self._build_rule_guide()}\n\n"
-            f"[Current Task]\n- target_formality={target_level}\n- rewrite_rule={FORMALITY_REWRITE_RULE}\n\n"
-            "선택한 격식 기준에 맞지 않는 문장만 골라 수정안을 작성하세요. 반드시 JSON만 출력하세요.\n\n"
-            f"대상 문장 목록:\n{sentence_lines}"
-        )
-
-    def _parse_classification_json(self, raw: str, sentences: list[SentenceToken]) -> dict[str, Any]:
+    def _parse_flow(self, raw: str, pass1_sentences: list[dict[str, Any]]) -> dict[str, Any]:
         payload = json.loads(raw)
-        items = payload.get("sentences", []) if isinstance(payload, dict) else []
-        allowed = {item["level"] for item in FORMALITY_RULE_STEPS}
+        flow_summary = str(payload.get("flow_summary", "")).strip()
         by_index: dict[int, dict[str, Any]] = {}
-        for item in items:
+        for item in payload.get("sentences", []):
             if not isinstance(item, dict):
                 continue
-            index = int(item.get("sentence_index", -1))
-            label = str(item.get("label", "")).strip()
-            if index < 0 or label not in allowed:
+            idx = int(item.get("sentence_index", -1))
+            if idx < 0:
                 continue
-            by_index[index] = {
-                "label": label,
-                "confidence": float(item.get("confidence", 0.0)),
-                "reason": str(item.get("reason", "")).strip(),
+            has_issue = bool(item.get("has_flow_issue", False))
+            reason = str(item.get("flow_issue_reason", "")).strip() or None
+            rewrite = str(item.get("flow_suggested_rewrite", "")).strip() or None
+            by_index[idx] = {
+                "has_flow_issue": has_issue,
+                "flow_issue_reason": reason if has_issue else None,
+                "flow_suggested_rewrite": rewrite if has_issue else None,
             }
-        labels: list[str] = []
-        reasons: list[str] = []
-        confidences: list[float] = []
-        for sentence in sentences:
-            matched = by_index.get(sentence.index)
-            if matched is None:
-                fallback_label = self._fallback_formality.detect_formality(sentence.ending)
-                labels.append(fallback_label)
-                reasons.append("AI 응답에 누락되어 규칙 기반 라벨로 보완했습니다.")
-                confidences.append(0.0)
-            else:
-                labels.append(matched["label"])
-                reasons.append(matched["reason"])
-                confidences.append(matched["confidence"])
-        distribution = Counter(labels)
-        dominant_label, dominant_count = distribution.most_common(1)[0] if distribution else ("mixed", 0)
-        if len(distribution) >= 3 or (labels and dominant_count / len(labels) < 0.7):
-            dominant_label = "mixed"
-        score = self._calculate_consistency_score(distribution, len(labels))
-        return {
-            "dominant_level": dominant_label,
-            "score": score,
-            "distribution": [DistributionItem(label=label, count=count) for label, count in distribution.items()],
-            "sentence_labels": labels,
-            "sentence_reasons": reasons,
-            "sentence_confidences": confidences,
-            "source": "ai",
-        }
+        results = []
+        for s in pass1_sentences:
+            idx = s["sentence_index"]
+            matched = by_index.get(idx, {"has_flow_issue": False, "flow_issue_reason": None, "flow_suggested_rewrite": None})
+            results.append({"sentence_index": idx, **matched})
+        return {"flow_summary": flow_summary, "sentences": results, "source": "ai"}
 
-    def _build_rule_based_classification(self, sentences: list[SentenceToken]) -> dict[str, Any]:
-        labels = [self._fallback_formality.detect_formality(sentence.ending) for sentence in sentences]
-        distribution = Counter(labels)
-        dominant_label, dominant_count = distribution.most_common(1)[0] if distribution else ("mixed", 0)
-        if len(distribution) >= 3 or (labels and dominant_count / len(labels) < 0.7):
-            dominant_label = "mixed"
+    def _rule_based_flow(self, pass1_sentences: list[dict[str, Any]]) -> dict[str, Any]:
         return {
-            "dominant_level": dominant_label,
-            "score": self._calculate_consistency_score(distribution, len(labels)),
-            "distribution": [DistributionItem(label=label, count=count) for label, count in distribution.items()],
-            "sentence_labels": labels,
-            "sentence_reasons": ["규칙 기반 fallback 분류입니다." for _ in sentences],
-            "sentence_confidences": [0.0 for _ in sentences],
+            "flow_summary": "흐름 분석은 AI 연결 시 제공됩니다.",
+            "sentences": [{"sentence_index": s["sentence_index"], "has_flow_issue": False, "flow_issue_reason": None, "flow_suggested_rewrite": None} for s in pass1_sentences],
             "source": "rule-based",
         }
 
-    def _build_rule_based_rewrites(self, target_level: str, sentences: list[SentenceAnalysis]) -> list[dict[str, Any]]:
-        rewrites: list[dict[str, Any]] = []
-        for sentence in sentences:
-            suggested = self._force_rewrite_sentence(sentence.text, target_level)
-            if self._normalize_sentence(suggested) == self._normalize_sentence(sentence.text):
-                continue
-            rewrites.append({
-                "sentence_index": sentence.index,
-                "original_sentence": sentence.text,
-                "current_formality": sentence.formality,
-                "target_formality": target_level,
-                "reason": FORMALITY_REWRITE_RULE,
-                "suggested_sentence": suggested,
-                "source": "rule-based",
-            })
-        return rewrites
+    # ── 공통 ──────────────────────────────────────────────────────────────────
 
-    def _parse_rewrite_json(self, raw: str, target_level: str) -> list[dict[str, Any]]:
-        payload = json.loads(raw)
-        items = payload.get("rewrites", []) if isinstance(payload, dict) else []
-        normalized: list[dict[str, Any]] = []
-        for item in items:
-            if not isinstance(item, dict):
-                continue
-            original_sentence = str(item.get("original_sentence", "")).strip()
-            suggested_sentence = str(item.get("suggested_sentence", "")).strip()
-            current_formality = str(item.get("current_formality", "")).strip()
-            reason = str(item.get("reason", "선택한 격식 기준에 맞게 문장을 조정했습니다.")).strip()
-            source = str(item.get("source", "ai")).strip() or "ai"
-            if not original_sentence:
-                continue
-            if not suggested_sentence or self._normalize_sentence(suggested_sentence) == self._normalize_sentence(original_sentence):
-                suggested_sentence = self._force_rewrite_sentence(original_sentence, target_level)
-                source = "rule-based"
-            if self._normalize_sentence(suggested_sentence) == self._normalize_sentence(original_sentence):
-                continue
-            normalized.append({
-                "sentence_index": int(item.get("sentence_index", 0)),
-                "original_sentence": original_sentence,
-                "current_formality": current_formality,
-                "target_formality": target_level,
-                "reason": reason,
-                "suggested_sentence": suggested_sentence,
-                "source": "ai" if source == "ai" else "rule-based",
-            })
-        return normalized
-
-    def _force_rewrite_sentence(self, sentence: str, target_level: str) -> str:
-        stripped = sentence.strip()
-        has_period = stripped.endswith(".")
-        bare = stripped[:-1] if has_period else stripped
-        rewritten = bare
-        replacements = [
-            ("보내줘", "보내요", "보내주세요", "보내드리겠습니다"),
-            ("확인해줘", "확인해요", "확인해주세요", "확인해 주시기 바랍니다"),
-            ("부탁해", "부탁해요", "부탁드립니다", "부탁드립니다"),
-            ("알려줘", "알려줘요", "알려주세요", "알려주시기 바랍니다"),
-            ("검토해줘", "검토해요", "검토 부탁드립니다", "검토해 주시기 바랍니다"),
-            ("왔어", "왔어요", "왔어요", "도착했습니다"),
-            ("했어", "했어요", "했어요", "수행했습니다"),
-        ]
-        if target_level == "격식 존댓말":
-            for plain, neutral, _, formal in replacements:
-                rewritten = rewritten.replace(plain, formal)
-                rewritten = rewritten.replace(neutral, formal)
-            if rewritten.endswith("요"):
-                rewritten = rewritten[:-1] + "습니다"
-            elif rewritten.endswith("다"):
-                rewritten = rewritten[:-1] + "습니다"
-            elif not rewritten.endswith(("습니다", "입니다", "드립니다", "바랍니다")):
-                rewritten = rewritten + " 바랍니다"
-        elif target_level == "중립 존댓말":
-            for plain, neutral, polite, formal in replacements:
-                rewritten = rewritten.replace(plain, neutral)
-                rewritten = rewritten.replace(polite, neutral)
-                rewritten = rewritten.replace(formal, neutral)
-            if rewritten.endswith("다"):
-                rewritten = rewritten[:-1] + "요"
-        elif target_level == "비격식 반말":
-            for plain, neutral, polite, formal in replacements:
-                rewritten = rewritten.replace(formal, plain)
-                rewritten = rewritten.replace(polite, plain)
-                rewritten = rewritten.replace(neutral, plain)
-            rewritten = rewritten.replace("입니다", "야").replace("습니다", "다")
-            if rewritten.endswith("냐"):
-                rewritten = rewritten[:-1] + "다"
-        rewritten = rewritten.strip()
-        if not rewritten:
-            rewritten = bare
-        if has_period and not rewritten.endswith("."):
-            rewritten += "."
-        return rewritten
+    def _call(self, system: str, model: str, prompt: str) -> str:
+        if self._client is None:
+            return ""
+        response = self._client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system}, {"role": "user", "content": prompt}],
+            response_format={"type": "json_object"},
+            temperature=0.1,
+            max_tokens=3000,
+        )
+        return response.choices[0].message.content or ""
 
     def _candidate_models(self) -> list[str]:
         models = [settings.llm_model]
-        models.extend(model.strip() for model in settings.llm_fallback_models.split(",") if model.strip())
+        models.extend(m.strip() for m in settings.llm_fallback_models.split(",") if m.strip())
         deduped: list[str] = []
-        for model in models:
-            if model not in deduped:
-                deduped.append(model)
+        for m in models:
+            if m not in deduped:
+                deduped.append(m)
         return deduped
 
-    def _calculate_consistency_score(self, distribution: Counter[str], sentence_count: int) -> float:
-        if sentence_count == 0:
-            return 0.0
-        dominant_count = distribution.most_common(1)[0][1] if distribution else 0
-        ratio = dominant_count / sentence_count
-        return round(50 + ratio * 50, 1)
-
-    def _make_classification_cache_key(self, sentences: list[SentenceToken]) -> str:
-        payload = [{"index": s.index, "text": s.text, "ending": s.ending} for s in sentences]
-        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        return "classify:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-    def _make_rewrite_cache_key(self, original_text: str, target_level: str, sentences: list[SentenceAnalysis]) -> str:
-        payload = {"text": original_text, "target_level": target_level, "sentences": [{"index": s.index, "text": s.text, "formality": s.formality} for s in sentences]}
-        serialized = json.dumps(payload, ensure_ascii=False, sort_keys=True)
-        return "rewrite:" + hashlib.sha256(serialized.encode("utf-8")).hexdigest()
-
-    def _normalize_sentence(self, sentence: str) -> str:
-        return " ".join(sentence.strip().rstrip(".").split())
+    def _hash(self, *parts: Any) -> str:
+        serialized = json.dumps(parts, ensure_ascii=False, sort_keys=True)
+        return hashlib.sha256(serialized.encode()).hexdigest()
