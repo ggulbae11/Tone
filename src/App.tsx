@@ -37,22 +37,62 @@ const AVAILABLE_LEVELS: TargetRewriteLevel[] = ["비격식 반말", "중립 존�
 {/*function isFormalityLevel(value: string): value is Exclude<FormalityLevel, "mixed"> {
   return value === "격식 존댓말" || value === "중립 존댓말" || value === "비격식 반말";
 }*/}
-
+const items: HistoryItem[] = [];
 function getRewriteSourceLabel(source: RewriteSuggestion["source"]) {
   return source === "ai" ? "AI 제안" : "규칙 기반 보정";
+}
+
+function getErrorMessage(error: unknown, fallback: string) {
+  if (error instanceof Error) {
+    if (error.message.includes("Network")) {
+      return "네트워크 연결을 확인해 주세요.";
+    }
+
+    return error.message;
+  }
+
+  return fallback;
 }
 
 function App() {
   const [text, setText] = useState(SAMPLE_TEXT);
   const [result, setResult] = useState<FullAnalysisResponse | null>(null);
   const [history, setHistory] = useState<HistoryItem[]>([]);
+  
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [rewritePlan, setRewritePlan] = useState<RewritePlanResponse | null>(null);
-  const [selectedLevel, setSelectedLevel] = useState<TargetRewriteLevel | null>(null);
+  const [selectedLevel, setSelectedLevel] = useState<Exclude<FormalityLevel, "mixed"> | "">("");
   const [selectedSentence, setSelectedSentence] = useState<number | null>(null);
+  const [issueCount, setIssueCount] = useState(0);
   type LoadingState = "idle" | "analyzing" | "rewriting" | "loadingSidebar";
   const [loading, setLoading] = useState<LoadingState>("idle");
 
+  const handleSelectHistory = async (item: HistoryItem) => {
+
+  
+  setText(item.input_text);
+  setSelectedSentence(null);
+
+  setSelectedLevel(
+    item.formality_level === "mixed" ? "" : item.formality_level
+  );
+
+  setIssueCount(item.issue_count);
+  setLoading("idle");
+  const analysis = await analyzeText(item.input_text);
+  setResult(analysis);
+  const plan = await fetchRewritePlan(
+    item.input_text,
+    item.formality_level === "mixed"
+      ? "비격식 반말"
+      : item.formality_level
+  );
+
+  setRewritePlan(plan);
+
+};
+  
+    
   const [error, setError] = useState<{
     analyze?: string; rewrite?: string; sidebar?: string;
   }>({});
@@ -64,7 +104,7 @@ function App() {
   async function loadSidebarData() {
     try {
       const [historyItems, statsItem] = await Promise.all([fetchHistory(), fetchStats()]);
-      setHistory(historyItems);
+      setHistory(historyItems.slice(0, 30));
       setStats(statsItem);
     } catch {
       setError((prev) => ({...prev, sidebar: "사이드바 정보를 불러오는 중 문제가 발생했습니다.",}));
@@ -72,9 +112,15 @@ function App() {
   }
 
   async function handleAnalyze() {
+    if (loading !== "idle") return;
+    if (!text.trim()) {
+      setError({ analyze: "분석할 문장을 입력해 주세요.", }); return; }
+    if (text.length > 5000) {
+      setError({ analyze: "입력은 5000자 이하만 가능합니다.", }); return; }
+
     setLoading("analyzing");
     setError({});
-    setRewritePlan(null);
+
     try {
       const analysisResult = await analyzeText(text);
       setResult(analysisResult);
@@ -87,7 +133,7 @@ function App() {
         setRewritePlan(plan);
       }
     } catch (caughtError) {
-      setError((prev) => ({...prev, analyze: caughtError instanceof Error ? caughtError.message : "분석 중 오류가 발생했습니다.",}));
+      setError((prev) => ({...prev, analyze: getErrorMessage(caughtError, "분석 중 오류가 발생했습니다."),}));
     } finally {
       setLoading("idle");
     }
@@ -98,12 +144,12 @@ function App() {
     setError({});
     setSelectedLevel(level);
     setSelectedSentence(null);
-    setRewritePlan(null);
+
     try {
       const plan = await fetchRewritePlan(currentText, level);
       setRewritePlan(plan);
     } catch (caughtError) {
-      setError((prev) => ({...prev, rewrite: caughtError instanceof Error ? caughtError.message : "수정안을 불러오지 못했습니다.",}));
+      setError((prev) => ({...prev, rewrite: getErrorMessage(caughtError, "수정안을 불러오지 못했습니다."),}));
     } finally {
       setLoading("idle");
     }
@@ -120,6 +166,7 @@ function App() {
   const selectedRewrite = selectedSentence !== null ? rewriteMap.get(selectedSentence) : null;
   const selectedSentenceData = selectedSentence !== null ? filteredSentences.find( (sentence) => sentence.index === selectedSentence ) : null;
   const summaryText = rewritePlan && rewritePlan.rewrites.length > 0 ? `${rewritePlan.rewrites.length}개의 문장을 수정했습니다.` : null;
+
   
   return (
     <div className="app-shell">
@@ -133,7 +180,8 @@ function App() {
           <MetricCard title="전체 분석 수" value={`${stats?.total_analyses ?? 0}`} subtitle={`평균 점수 ${stats?.average_score ?? 0}`} accent="green" />
           {/*<MetricCard title="가장 자주 나온 격식" value={stats?.most_common_formality ?? "n/a"} subtitle={`대표 톤 ${stats?.most_common_tone ?? "n/a"}`} accent="orange" />*/}
         </div>
-        <HistoryPanel items={history.slice(0, 3)} />
+        <HistoryPanel items={history} onSelect={handleSelectHistory} />
+        {error.sidebar && ( <p className="error-text">{error.sidebar}</p> )}
       </aside>
 
       <main className="main-content">
@@ -157,7 +205,7 @@ function App() {
             </div>
             <textarea className="text-editor" value={text} onChange={(event) => setText(event.target.value)} placeholder="문장을 입력하거나 붙여넣어 주세요. 문장 분리는 온점(.) 기준으로 처리됩니다." />
             <div className="input-actions">
-              <button className="primary-button" type="button" onClick={() => void handleAnalyze()} disabled={loading !== "idle"}>{loading === "analyzing" ? "분석 중..." : "분석 실행"}</button>
+              <button className="primary-button" type="button" onClick={() => void handleAnalyze()} disabled={loading !== "idle" || !text.trim()}>{loading === "analyzing" ? "분석 중..." : "분석 실행"}</button>
               {error.analyze && ( <p className="error-text">{error.analyze}</p> )}
             </div>
             {selectedGuide ? ( <div className="selected-formality-note"><strong>{selectedGuide.title}</strong> <p>{selectedGuide.description}</p><small>예: {selectedGuide.example}</small></div> ) : null}
@@ -187,12 +235,11 @@ function App() {
             
             <section className="panel">
               <div className="panel__header">
-                <h3>수정 제안</h3>
-                <span>
+                <span className="rewrite-status">
                   {loading === "rewriting" ? `${selectedLevel}을 기준으로 분석 중입니다...` : rewritePlan ? `${selectedLevel}을 기준으로 수정 완료` : "" }
                 </span>
               </div>
-              {summaryText ? <p className="rewrite-summary">{summaryText}</p> : null}
+              {summaryText && loading !== "rewriting" ? ( <p className="rewrite-summary">{summaryText}</p> ) : null}
               {selectedRewrite && selectedSentenceData ? (
                 <div className="rewrite-detail-panel">
                   <h4 className="rewrite-detail-title"> 수정 제안 상세 </h4>
@@ -212,6 +259,8 @@ function App() {
                       <div className="sentence-skeleton" />
                     </div>
                   </div>
+                ) : !rewritePlan ? (
+                  <p className="empty-state"> 분석을 실행하면 AI 수정안이 표시됩니다. </p>
                 ) : rewriteMap.size === 0 ? (
                   <p className="empty-state"> 선택한 격식 기준에서 수정이 필요한 문장이 없습니다. </p>
                 ) : ( 

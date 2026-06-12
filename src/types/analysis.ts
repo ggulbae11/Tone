@@ -66,10 +66,11 @@ export interface HistoryItem {
   id: number;
   input_text: string;
   overall_score: number;
-  formality_level: string;
+  formality_level: "격식 존댓말" | "중립 존댓말" | "비격식 반말" | "mixed";
   tone_label: string;
   issue_count: number;
   created_at: string;
+  result?: { analysis: FullAnalysisResponse; rewritePlan?: RewritePlanResponse; };
 }
 
 export interface StatsResponse {
